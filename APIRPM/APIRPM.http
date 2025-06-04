@@ -1,0 +1,6 @@
+@APIRPM_HostAddress = http://localhost:5219
+
+GET {{APIRPM_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
