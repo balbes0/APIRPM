@@ -6,6 +6,13 @@ using System.Text.RegularExpressions;
 using System.Text;
 using System.Security.Cryptography;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.AspNetCore.Identity;
+using System.Security.Claims;
+using Microsoft.IdentityModel.Tokens;
+using APIRPM.Models.JWT;
+using System.IdentityModel.Tokens.Jwt;
+using Microsoft.Extensions.Options;
+using Microsoft.AspNetCore.Authorization;
 
 namespace APIRPM.Controllers
 {
@@ -14,36 +21,19 @@ namespace APIRPM.Controllers
     public class HomeController : ControllerBase
     {
         private readonly Rpm2testContext _db;
-
-        public HomeController(Rpm2testContext rpm2Context)
+        private JwtSettings _jwtSettings;
+        public HomeController(IOptions<JwtSettings> jwtSettings,Rpm2testContext rpm2Context)
         {
             _db = rpm2Context;
+            _jwtSettings = jwtSettings.Value;
         }
 
-        // =================== УТИЛИТЫ ===================
-
-        // Хеширование SHA256
-        public static string ComputeSha256Hash(string rawData)
-        {
-            using (SHA256 sha256Hash = SHA256.Create())
-            {
-                byte[] bytes = sha256Hash.ComputeHash(Encoding.UTF8.GetBytes(rawData));
-                var builder = new StringBuilder();
-                foreach (var b in bytes)
-                    builder.Append(b.ToString("x2"));
-                return builder.ToString();
-            }
-        }
-
-        // Валидация телефонного номера
         public static bool IsPhoneNumberValid(string phoneNumber)
         {
             string pattern = @"^((8|\+7)[\- ]?)?(\(?\d{3}\)?[\- ]?)?[\d\- ]{7,10}$";
             return Regex.IsMatch(phoneNumber, pattern);
         }
 
-        // =================== 1) GET: Список всех товаров ===================
-        // GET /api/Home
         [HttpGet]
         public async Task<ActionResult<IEnumerable<CatalogDto>>> Index()
         {
@@ -58,7 +48,6 @@ namespace APIRPM.Controllers
                     Stock = c.Stock,
                     CategoryName = c.CategoryName,
                     PathToImage = c.PathToImage,
-                    // Обратите внимание: без Reviews, без вычисления рейтинга/количества
                     ReviewCount = c.Reviews.Count(r => r.Rating.HasValue),
                     AverageRating = c.Reviews.Any(r => r.Rating.HasValue)
                         ? c.Reviews
@@ -70,7 +59,6 @@ namespace APIRPM.Controllers
                 })
                 .ToListAsync();
 
-            // Если нужно пометить IsInCart (для залогиненного пользователя), делаем 2-й проход:
             int? userId = HttpContext.Session.GetInt32("UserID");
             if (userId != null)
             {
@@ -88,8 +76,6 @@ namespace APIRPM.Controllers
             return Ok(catalogs);
         }
 
-        // =================== 2) GET: Фильтрация/поиск/сортировка каталога ===================
-        // GET /api/Home/Catalog?filter=...&search=...&sort=...
         [HttpGet("Catalog")]
         public async Task<ActionResult<IEnumerable<CatalogDto>>> Catalog(
             [FromQuery] string? filter,
@@ -150,8 +136,6 @@ namespace APIRPM.Controllers
             return Ok(catalogList);
         }
 
-        // =================== 3) GET: Отзывы для товара ===================
-        // GET /api/Home/Reviews/{id}
         [HttpGet("Reviews/{id:int}")]
         public async Task<ActionResult<ProductReviewsViewModelDto>> Reviews(int id)
         {
@@ -168,7 +152,7 @@ namespace APIRPM.Controllers
                     IdReview = r.IdReview,
                     UserId = r.UserId,
                     ProductId = r.ProductId,
-                    Rating = r.Rating ?? 0,                       // r.Rating — int?
+                    Rating = r.Rating ?? 0,
                     ReviewText = r.ReviewText,
                     CreatedDate = r.CreatedDate,
                     FirstName = r.User.FirstName,
@@ -186,8 +170,7 @@ namespace APIRPM.Controllers
             return Ok(model);
         }
 
-        // =================== 4) POST: Добавить отзыв ===================
-        // POST /api/Home/AddReview
+        [Authorize]
         [HttpPost("AddReview")]
         public async Task<ActionResult> AddReview([FromBody] AddReviewRequest request)
         {
@@ -214,8 +197,6 @@ namespace APIRPM.Controllers
             return CreatedAtAction(nameof(Reviews), new { id = request.ProductId }, null);
         }
 
-        // =================== 5) POST: Регистрация пользователя ===================
-        // POST /api/Home/Register
         [HttpPost("Register")]
         public async Task<ActionResult> Register([FromBody] RegisterRequest request)
         {
@@ -230,14 +211,14 @@ namespace APIRPM.Controllers
             if (alreadyExists)
                 return BadRequest(new { message = "Пользователь с таким email или номером телефона уже зарегистрирован." });
 
-            string hashedPassword = ComputeSha256Hash(request.Password);
+            string hashedPassword = BCrypt.Net.BCrypt.HashPassword(request.Password);
 
             var user = new User
             {
                 Phone = request.PhoneNumber,
                 Email = request.Email,
                 Password = hashedPassword,
-                RoleId = 2, // по умолчанию “обычный” пользователь
+                RoleId = 2,
                 RegistrationDate = DateOnly.FromDateTime(DateTime.UtcNow)
             };
 
@@ -253,34 +234,45 @@ namespace APIRPM.Controllers
             });
         }
 
-        // =================== 6) POST: Логин ===================
-        // POST /api/Home/Login
         [HttpPost("Login")]
         public async Task<ActionResult> Login([FromBody] LoginRequest request)
         {
-            var user = await _db.Users.FirstOrDefaultAsync(u => u.Email == request.Email);
-            if (user == null)
-                return NotFound(new { message = "Пользователь с таким email не найден." });
+            var user = await AuthenticateUser(request.Email, request.Password);
 
-            string hashedPassword = ComputeSha256Hash(request.Password);
-            if (hashedPassword != user.Password)
-                return BadRequest(new { message = "Неверный пароль." });
+            if (user == null)
+            {
+                return Unauthorized();
+            }
 
             HttpContext.Session.SetInt32("UserID", user.IdUser);
             HttpContext.Session.SetString("IsAuthenticated", "true");
             HttpContext.Session.SetInt32("RoleID", user.RoleId);
+
+            var token = GenerateJwtToken(user);
 
             return Ok(new
             {
                 user.IdUser,
                 user.Email,
                 user.Phone,
-                user.RoleId
+                user.RoleId,
+                token
             });
         }
 
-        // =================== 7) GET: Профиль текущего пользователя ===================
-        // GET /api/Home/Profile
+        private async Task<User> AuthenticateUser(string email, string password)
+        {
+            var user = await _db.Users.FirstOrDefaultAsync(u=> u.Email == email);
+
+            if (user == null || !user.VerifyPassword(password))
+            {
+                return null;
+            }
+
+            return user;
+        }
+
+        [Authorize]
         [HttpGet("Profile")]
         public async Task<ActionResult<UserProfileDto>> Profile()
         {
@@ -313,8 +305,7 @@ namespace APIRPM.Controllers
             return Ok(user);
         }
 
-        // =================== 8) POST: Logout ===================
-        // POST /api/Home/Logout
+        [Authorize]
         [HttpPost("Logout")]
         public ActionResult Logout()
         {
@@ -322,33 +313,7 @@ namespace APIRPM.Controllers
             return Ok(new { message = "Вы успешно вышли." });
         }
 
-        // =================== 9) GET: EasyData (только для RoleId == 1) ===================
-        // GET /api/Home/EasyData
-        [HttpGet("EasyData")]
-        public async Task<ActionResult> EasyData()
-        {
-            int? userId = HttpContext.Session.GetInt32("UserID");
-            if (userId == null)
-                return Unauthorized(new { message = "Не авторизован." });
-
-            var user = await _db.Users
-                .AsNoTracking()
-                .FirstOrDefaultAsync(u => u.IdUser == userId.Value);
-            if (user == null)
-                return NotFound(new { message = "Пользователь не найден." });
-
-            if (user.RoleId == 1)
-            {
-                return Ok(new { message = "Добро пожаловать в EasyData, администратор!" });
-            }
-            else
-            {
-                return Forbid();
-            }
-        }
-
-        // =================== 10) GET: Корзина текущего пользователя ===================
-        // GET /api/Home/Cart
+        [Authorize]
         [HttpGet("Cart")]
         public async Task<ActionResult<IEnumerable<CartItemDto>>> Cart()
         {
@@ -375,8 +340,7 @@ namespace APIRPM.Controllers
             return Ok(cartItems);
         }
 
-        // =================== 11) POST: Добавить товар в корзину ===================
-        // POST /api/Home/AddToCart
+        [Authorize]
         [HttpPost("AddToCart")]
         public async Task<ActionResult> AddToCart(AddToCartRequest request)
         {
@@ -406,8 +370,7 @@ namespace APIRPM.Controllers
             return Created(string.Empty, new { message = "Товар добавлен в корзину." });
         }
 
-        // =================== 12) PUT: Обновить количество в корзине ===================
-        // PUT /api/Home/UpdateCartQuantity
+        [Authorize]
         [HttpPut("UpdateCartQuantity")]
         public async Task<ActionResult> UpdateCartQuantity([FromBody] UpdateCartRequest request)
         {
@@ -426,8 +389,7 @@ namespace APIRPM.Controllers
             return Ok(new { message = "Количество обновлено." });
         }
 
-        // =================== 13) DELETE: Удалить товар из корзины ===================
-        // DELETE /api/Home/RemoveCartItem/{productId}
+        [Authorize]
         [HttpDelete("RemoveCartItem/{productId:int}")]
         public async Task<ActionResult> RemoveCartItem(int productId)
         {
@@ -446,55 +408,40 @@ namespace APIRPM.Controllers
             return Ok(new { message = "Товар удалён из корзины." });
         }
 
-        // =================== 14) POST: Оформление заказа ===================
-        // POST /api/Home/Order
-        [HttpPost("Order")]
-        public ActionResult Order()
-        {
-            int? userId = HttpContext.Session.GetInt32("UserID");
-            if (userId == null)
-                return Unauthorized(new { message = "Не авторизован." });
-
-            // Здесь может быть любая логика создания заказа
-            return Ok(new { message = "Order endpoint: реализуйте свою логику оформления." });
-        }
-
-        // =================== 15) GET: О нас (AboutUs) ===================
-        // GET /api/Home/AboutUs
-        [HttpGet("AboutUs")]
-        public ActionResult AboutUs()
-        {
-            var info = new
-            {
-                Company = "Ваша компания",
-                Description = "Немного информации о нас...",
-                Contact = "contact@company.com"
-            };
-            return Ok(info);
-        }
-
-        // =================== 16) GET: Политика конфиденциальности ===================
-        // GET /api/Home/Privacy
-        [HttpGet("Privacy")]
-        public ActionResult Privacy()
-        {
-            var text = "Политика конфиденциальности вашего приложения...";
-            return Ok(new { PrivacyPolicy = text });
-        }
-
-        // =================== 17) GET: Обработка ошибок ===================
-        // GET /api/Home/Error
         [HttpGet("Error")]
         public ActionResult Error()
         {
             var requestId = Activity.Current?.Id ?? HttpContext.TraceIdentifier;
             return Problem(detail: "Произошла ошибка на сервере.", instance: requestId);
         }
+
+        private string GenerateJwtToken(User user)
+        {
+            var claims = new[]
+            {
+                new Claim(ClaimTypes.NameIdentifier, user.IdUser.ToString()),
+                new Claim(ClaimTypes.Name, user.FirstName),
+                new Claim(ClaimTypes.Email, user.Email),
+                new Claim("Role", user.RoleId.ToString() ?? "Guest")
+            };
+
+            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwtSettings.SecretKey));
+            var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+            var token = new JwtSecurityToken(
+                issuer: _jwtSettings.Issuer,
+                audience: _jwtSettings.Audience,
+                claims: claims,
+                expires: DateTime.Now.AddMinutes(_jwtSettings.TokenLifetimeMinutes),
+                signingCredentials: creds
+            );
+
+            return new JwtSecurityTokenHandler().WriteToken(token);
+        }
     }
 
     #region ==== DTO-классы для запросов/ответов ====
 
-    // DTO для отображения товара в каталоге
     public class CatalogDto
     {
         public int IdProduct { get; set; }
@@ -506,26 +453,23 @@ namespace APIRPM.Controllers
         public string? CategoryName { get; set; }
         public string? PathToImage { get; set; }
 
-        // Вычисляемые поля
-        public int ReviewCount { get; set; }      // общее количество рейтингованных отзывов
-        public decimal AverageRating { get; set; } // средний рейтинг (0, если нет отзывов)
-        public bool IsInCart { get; set; }        // заполняется отдельно, если пользователь залогинен
+        public int ReviewCount { get; set; }   
+        public decimal AverageRating { get; set; } 
+        public bool IsInCart { get; set; }     
     }
 
-    // DTO для одиночного отзыва с именем/фамилией пользователя
     public class ReviewDto
     {
         public int IdReview { get; set; }
         public int UserId { get; set; }
         public int ProductId { get; set; }
-        public int Rating { get; set; }         // r.Rating может быть null, но в DTO кладём 0 по умолчанию
+        public int Rating { get; set; }       
         public string? ReviewText { get; set; }
         public DateTime? CreatedDate { get; set; }
-        public string? FirstName { get; set; }  // подтягивается через r.User.FirstName
-        public string? LastName { get; set; }   // через r.User.LastName
+        public string? FirstName { get; set; } 
+        public string? LastName { get; set; } 
     }
 
-    // ViewModel-DTO для ответа GET /Reviews/{id}
     public class ProductReviewsViewModelDto
     {
         public int ProductId { get; set; }
@@ -533,7 +477,6 @@ namespace APIRPM.Controllers
         public List<ReviewDto> Reviews { get; set; } = new();
     }
 
-    // DTO для запроса добавления нового отзыва
     public class AddReviewRequest
     {
         public int ProductId { get; set; }
@@ -541,7 +484,6 @@ namespace APIRPM.Controllers
         public string ReviewText { get; set; } = null!;
     }
 
-    // DTO для регистрации
     public class RegisterRequest
     {
         public string PhoneNumber { get; set; } = null!;
@@ -550,14 +492,12 @@ namespace APIRPM.Controllers
         public string ConfirmPassword { get; set; } = null!;
     }
 
-    // DTO для логина
     public class LoginRequest
     {
         public string Email { get; set; } = null!;
         public string Password { get; set; } = null!;
     }
 
-    // DTO для профиля пользователя (ответ на GET /Profile)
     public class UserProfileDto
     {
         public int IdUser { get; set; }
@@ -570,7 +510,6 @@ namespace APIRPM.Controllers
         public int RoleId { get; set; }
     }
 
-    // DTO для одного элемента корзины (ответ GET /Cart)
     public class CartItemDto
     {
         public int ProductId { get; set; }
@@ -583,14 +522,12 @@ namespace APIRPM.Controllers
         public decimal Total { get; set; }
     }
 
-    // DTO для запроса “добавить в корзину”
     public class AddToCartRequest
     {
         public int ProductId { get; set; }
         public int Quantity { get; set; } = 1;
     }
 
-    // DTO для запроса “обновить количество”
     public class UpdateCartRequest
     {
         public int ProductId { get; set; }
